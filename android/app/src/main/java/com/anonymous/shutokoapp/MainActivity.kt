@@ -1,4 +1,4 @@
-package com.shutokoapp
+package com.anonymous.shutokoapp
 
 import android.os.Build
 import android.os.Bundle
