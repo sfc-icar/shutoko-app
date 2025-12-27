@@ -1,7 +1,10 @@
-import React, { useEffect, useState, useRef } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity } from 'react-native';
-import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
+import React, { useEffect, useState, useCallback } from 'react';
+import { StyleSheet, View, Text } from 'react-native';
+import { Camera, useCameraDevice, useCameraPermission, useFrameProcessor } from 'react-native-vision-camera';
 import { useTensorflowModel } from 'react-native-fast-tflite';
+import { useResizePlugin } from 'vision-camera-resize-plugin';
+import { useSharedValue } from 'react-native-reanimated';
+import { useRunOnJS } from 'react-native-worklets-core';
 
 export default function App() {
   // 1. カメラの権限を管理
@@ -12,8 +15,6 @@ export default function App() {
 
   // 3. 状態管理
   const [modelResult, setModelResult] = useState<string | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const cameraRef = useRef<Camera>(null);
 
   useEffect(() => {
     // 起動時に権限をリクエスト
@@ -22,46 +23,72 @@ export default function App() {
     }
   }, [hasPermission]);
 
-  // TFLiteモデルをロード（react-native-fast-tfliteのAPIを使用）
-  const tensorflowModel = useTensorflowModel(require('./assets/30emodel-float32.tflite'));
-  const model = tensorflowModel.state === 'loaded' ? tensorflowModel.model : undefined;
+  // 1. モデルロード
+  const plugin = useTensorflowModel(require('./assets/30emodel-float32.tflite'));
+  const model = plugin.state === 'loaded' ? plugin.model : undefined;
 
-  // ボタンを押したら推論を実行
-  const handleInference = async () => {
-    if (isProcessing || !model || !cameraRef.current) {
-      console.log('スキップ: 処理中またはモデル/カメラが準備できていません');
-      return;
-    }
+  // 2. リサイズ用プラグインのロード
+  const { resize } = useResizePlugin();
 
-    setIsProcessing(true);
-    setModelResult('処理中...');
+  // 3. タイマー管理（15秒間隔）
+  const lastRun = useSharedValue(0);
 
-    try {
-      // カメラから写真を撮影
-      console.log('📸 写真を撮影します...');
-      const photo = await cameraRef.current.takePhoto({
-        flash: 'off',
-      });
+  // 4. 結果表示用 (JS側) - 数値のみを受け取る
+  const updateResult = useCallback((value0: number, value1: number) => {
+    console.log('推論完了: value0=', value0, 'value1=', value1);
+    // モデルの出力に合わせて判定
+    const label = value0 > value1 ? '首都高' : '一般道';
+    setModelResult(label);
+  }, []);
 
-      console.log('✅ 写真を撮影しました:', photo.path);
+  // useRunOnJSで安全にJS関数を呼び出す
+  const runUpdate = useRunOnJS(updateResult, []);
 
-      // TODO: 写真をモデルの入力形式に変換して推論を実行
-      // 例: 写真を読み込んで、リサイズして、モデルに入力
-      // const imageData = await loadImage(photo.path);
-      // const resized = resizeImage(imageData, { width: 224, height: 224 });
-      // const outputs = model.runSync([resized]);
+  // フレームプロセッサ（worklet内で直接推論）
+  const frameProcessor = useFrameProcessor(
+    (frame) => {
+      'worklet';
 
-      // 一時的な結果表示
-      setModelResult('推論実装待ち（写真撮影は成功）');
-      console.log('✅ 推論処理完了');
+      if (plugin.state !== 'loaded' || !model || !resize) return;
 
-    } catch (error) {
-      console.error('❌ 推論エラー:', error);
-      setModelResult('エラー: ' + (error as Error).message);
-    } finally {
-      setIsProcessing(false);
-    }
-  };
+      const now = Date.now();
+      // 15秒経過チェック
+      if (now - lastRun.value > 15000) {
+        try {
+          // フレームをリサイズ
+          const resized = resize(frame, {
+            scale: {
+              width: 224,
+              height: 224,
+            },
+            pixelFormat: 'rgb',
+            dataType: 'float32',
+          });
+
+          if (!resized) return;
+
+          // 推論実行
+          const outputs = model.runSync([resized]);
+
+          // outputsはTypedArrayの配列なので、worklet内で処理
+          const out0 = outputs && outputs.length > 0 ? outputs[0] : undefined;
+          if (!out0 || out0.length < 2) return;
+
+          // 必要な数値だけを抽出してJSに渡す
+          const value0 = Number(out0[0]);
+          const value1 = Number(out0[1]);
+
+          // 数値のみをJSに渡す
+          runUpdate(value0, value1);
+
+          lastRun.value = now;
+        } catch (e) {
+          // エラーは無視（worklet内でログを出すと重い）
+        }
+      }
+    },
+    [plugin, model, resize, runUpdate]
+  );
 
   if (!hasPermission) return <View style={styles.container}><Text>カメラ権限がありません</Text></View>;
   if (device == null) return <View style={styles.container}><Text>カメラが見つかりません</Text></View>;
@@ -70,25 +97,14 @@ export default function App() {
     <View style={styles.container}>
       {/* カメラを表示 */}
       <Camera
-        ref={cameraRef}
         style={StyleSheet.absoluteFillObject}
         device={device}
         isActive={true}
-        photo={true}
+        frameProcessor={frameProcessor}
       />
       <View style={styles.overlay}>
         <Text style={styles.text}>首都高判定アプリ (v0.1)</Text>
       </View>
-      {/* 推論ボタン */}
-      <TouchableOpacity
-        style={[styles.button, isProcessing && styles.buttonDisabled]}
-        onPress={handleInference}
-        disabled={isProcessing || !model}
-      >
-        <Text style={styles.buttonText}>
-          {isProcessing ? '処理中...' : '推論実行'}
-        </Text>
-      </TouchableOpacity>
       {/* モデル実行結果 */}
       {modelResult && (
         <View style={styles.resultContainer}>
@@ -103,25 +119,6 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: 'black', justifyContent: 'center', alignItems: 'center' },
   overlay: { position: 'absolute', bottom: 50, backgroundColor: 'rgba(0,0,0,0.5)', padding: 10, borderRadius: 10 },
   text: { color: 'white', fontSize: 20 },
-  button: {
-    position: 'absolute',
-    bottom: 120,
-    alignSelf: 'center',
-    backgroundColor: 'rgba(0, 122, 255, 0.9)',
-    paddingHorizontal: 40,
-    paddingVertical: 15,
-    borderRadius: 25,
-    minWidth: 150,
-  },
-  buttonDisabled: {
-    backgroundColor: 'rgba(128, 128, 128, 0.7)',
-  },
-  buttonText: {
-    color: 'white',
-    fontSize: 18,
-    fontWeight: 'bold',
-    textAlign: 'center',
-  },
   resultContainer: {
     position: 'absolute',
     top: 100,
