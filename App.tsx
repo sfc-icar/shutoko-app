@@ -72,7 +72,7 @@ export default function App() {
     setValue0(value0); // value0を保存
     setValue1(value1); // value1を保存
     // モデルの出力に合わせて判定
-    const label = value0 > value1 ? '首都高' : '一般道';
+    const label = value0 < value1 ? '首都高' : '一般道';
     setModelResult(label);
     // 推論が完了したらカウントダウンをリセット
     resetCountdown();
